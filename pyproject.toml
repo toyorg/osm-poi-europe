@@ -1,0 +1,17 @@
+[project]
+name = "osm-poi-europe"
+version = "0.1.0"
+description = "POIs for MIB based on OpenStreetMap"
+requires-python = ">=3.11"
+dependencies = [
+  "fiona==1.10.1",
+  "geopandas==1.1.3",
+  "pillow==12.2.0",
+  "requests==2.33.1",
+  "retrying==1.4.2",
+  "rich==15.0.0",
+  "shapely==2.1.2",
+]
+
+[tool.uv]
+package = false

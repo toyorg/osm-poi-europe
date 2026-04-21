@@ -1,1 +1,2 @@
-VERSION=0.04
+from datetime import datetime
+VERSION=str(datetime.now().date())

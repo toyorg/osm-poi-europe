@@ -26,7 +26,6 @@ import hashlib
 checkSumSize = 524288
 
 def file_sha1(path, checkSumSize = 0):
-  print("Generating hash for: %s" % (path))
   with open(path,'rb') as f:
     if checkSumSize!=0:
       l = 0
@@ -49,26 +48,22 @@ def file_sha1(path, checkSumSize = 0):
 def generate_hashes(base):
   size = 0
   hashes = os.path.join( base, "hashes.txt" )
-  print("Generating hashes.txt: %s" % (hashes))
   with open(hashes,'w') as fd:
     for path,dnames,fnames in os.walk(base):
       for f in sorted(fnames):
-         if f!='hashes.txt':
-           (length, digests) = file_sha1( os.path.join(path,f), checkSumSize )
-           relpath = os.path.relpath(path,base)
-           if relpath != '.':
-             f = os.path.join(relpath,f).replace(os.sep,'/')
-           fd.write('FileName = "' + f + '"\n')
-           fd.write('FileSize = "' + str(length) + '"\n')
-           fd.write('CheckSumSize = "%d"\n' % checkSumSize)
-           i=0
-           for digest in digests:
-             if i==0: suffix=''
-             else: suffix=str(i)
-             fd.write('CheckSum%s = "%s"\n' % (suffix,digest))
-             i+=1
-           fd.write('\n')
-           size += length
+        if f!='hashes.txt':
+          (length, digests) = file_sha1( os.path.join(path,f), checkSumSize )
+          relpath = os.path.relpath(path,base)
+          if relpath != '.':
+            f = os.path.join(relpath,f).replace(os.sep,'/')
+          fd.write(f'FileName = "{f}"\n')
+          fd.write(f'FileSize = "{str(length)}"\n')
+          fd.write(f'CheckSumSize = "{checkSumSize}"\n')
+          for i, digest in enumerate(digests):
+            suffix = '' if i==0 else str(i)
+            fd.write('CheckSum%s = "%s"\n' % (suffix,digest))
+          fd.write('\n')
+          size += length
 
   return ( hashes, size )
 
@@ -87,7 +82,7 @@ def fix(base):
   config = configparser.ConfigParser()
   config.optionxform=str # make case sensitive
 
-  config.readfp(open(metainfo_path))
+  config.read_file(open(metainfo_path))
 
   for section in config.sections():
 
@@ -102,8 +97,8 @@ def fix(base):
       source = config[section]['Source'].strip('"').replace('/',os.sep) if config.has_option(section,'Source') else ''
       source = os.path.join(section_os,source)
       (length,digest) = dir_sha1( os.path.join(base,source) )
-      config[section]['FileSize'] = '"%d"' % length
-      config[section]['CheckSum'] = '"%s"' % digest
+      config[section]['FileSize'] = f'"{length}"'
+      config[section]['CheckSum'] = f'"{digest}"'
     elif section.endswith('\\File'):
       #
       # For a file:
@@ -114,14 +109,14 @@ def fix(base):
       source = config[section]['Source'].strip('"').replace('/',os.sep) if config.has_option(section,'Source') else ''
       source = os.path.join(section_os,source)
       (length,digest) = file_sha1( os.path.join(base,source) )
-      config[section]['FileSize'] = '"%d"' % length
-      config[section]['CheckSum'] = '"%s"' % digest
+      config[section]['FileSize'] = f'"{length}"'
+      config[section]['CheckSum'] = f'"{digest}"'
 
   #
   # Write the metainfo2.txt file and calculate the checksum
   #
   config.remove_option('common','MetafileChecksum')
-  
+
   with open(metainfo_path,"w") as configfile:
     config.write(configfile)
 
@@ -131,7 +126,7 @@ def fix(base):
   # Now rewrite the metainfo2.txt file with the checksum included
   #
 
-  config.set('common','MetafileChecksum','"%s"' % digest)
+  config.set('common', 'MetafileChecksum', f'"{digest}"')
 
   with open(metainfo_path,"w") as configfile:
     config.write(configfile)
@@ -139,7 +134,7 @@ def fix(base):
 
 if __name__ == "__main__":
   if len(sys.argv)!=2:
-    print("usage: %s <path to MIB2HIGH or MIB2TSD directory>" % sys.argv[0])
+    print(f"usage: {sys.argv[0]} <path to MIB2HIGH or MIB2TSD directory>")
     sys.exit(1)
 
   base = sys.argv[1]
