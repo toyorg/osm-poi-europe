@@ -5,6 +5,10 @@ on:
     - cron: "0 0 * * 1" # Runs on mondays at midnight UTC
   workflow_dispatch: # Allows manual triggering
 
+permissions:
+  contents: write
+  actions: read
+
 jobs:
   build-release-and-cleanup:
     runs-on: ubuntu-latest
