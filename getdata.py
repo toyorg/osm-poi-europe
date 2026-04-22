@@ -182,7 +182,7 @@ countries = {
     'Poland': 49715,
     'Portugal': 295480,
     'Romania': 90689,
-    'Russia': 60189,
+    # 'Russia': 60189,
     'San Marino': 54624,
     'Serbia': 1741311,
     'Slovakia': 14296,
