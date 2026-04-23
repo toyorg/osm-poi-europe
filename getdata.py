@@ -9,7 +9,6 @@ import requests
 import shutil
 from concurrent.futures import ProcessPoolExecutor
 from retrying import retry
-from rich import progress
 from shapely.geometry import Point, Polygon
 
 import mypois
@@ -182,7 +181,7 @@ countries = {
     'Poland': 49715,
     'Portugal': 295480,
     'Romania': 90689,
-    'Russia': 60189,
+    # 'Russia': 60189,
     'San Marino': 54624,
     'Serbia': 1741311,
     'Slovakia': 14296,
@@ -198,14 +197,28 @@ countries = {
 
 countries_count = len(countries)
 
+OVERPASS_URLS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+]
+USER_AGENT = 'osm-poi-europe'
+
 
 @retry(wait_random_min=30000, wait_random_max=60000, stop_max_attempt_number=10)
 def get_data(query):
-    url = 'https://overpass-api.de/api/interpreter'
-    response = requests.post(url, data=f'data={query}', headers={'User-Agent': 'osm-poi-europe'})
-    if response.status_code == 200:
-        return response.json()['elements']
-    raise requests.ConnectionError
+    start_index = abs(hash(query)) % len(OVERPASS_URLS)
+    ordered_urls = OVERPASS_URLS[start_index:] + OVERPASS_URLS[:start_index]
+    last_exception = None
+
+    for url in ordered_urls:
+        try:
+            response = requests.post(url, data={'data': query}, headers={'User-Agent': USER_AGENT})
+            if response.status_code == 200:
+                return response.json()['elements']
+        except requests.RequestException as exc:
+            last_exception = exc
+
+    raise requests.ConnectionError('All Overpass endpoints failed') from last_exception
 
 
 def generate_gpx(array, points_series, name):
@@ -318,38 +331,33 @@ if __name__ == "__main__":
 
     print('Downloading data')
 
-    with progress.Progress("[progress.description]{task.description}", progress.BarColumn(), "[progress.percentage]{task.percentage:>3.0f}%", progress.TimeRemainingColumn(), progress.TimeElapsedColumn(), refresh_per_second=1) as progress:
-        futures = []
-        with multiprocessing.Manager() as manager:
-            _progress = manager.dict()
-            overall_progress_task = progress.add_task("[green]All jobs progress:")
-            with ProcessPoolExecutor(max_workers=8) as executor:
-                for i in [eval(f) for f in config.sections() if f != 'General']:
-                    task_id = progress.add_task(f"{i.__name__}")
-                    futures.append(executor.submit(i, _progress, task_id))
+    futures = []
+    with multiprocessing.Manager() as manager:
+        _progress = manager.dict()
+        with ProcessPoolExecutor(max_workers=8) as executor:
+            for i in [eval(f) for f in config.sections() if f != 'General']:
+                task_id = f"{i.__name__}"
+                futures.append(executor.submit(i, _progress, task_id))
 
-                ci_percent, ci_percent_last = 0.0, 0.0
+            ci_percent, ci_percent_last = 0.0, 0.0
 
-                while (n_finished := sum(future.done() for future in futures)) < len(futures):
-                    progress.update(overall_progress_task, completed=n_finished, total=len(futures)+2)
-                    processed,total = 0,0
-                    for task_id, update_data in _progress.items():
-                        progress.update(task_id, completed=update_data["progress"], total=update_data["total"])
-                        processed+=update_data["progress"]
-                        total+=update_data["total"]
+            while (n_finished := sum(future.done() for future in futures)) < len(futures):
+                processed,total = 0,0
+                for task_id, update_data in _progress.items():
+                    processed+=update_data["progress"]
+                    total+=update_data["total"]
 
-                    ci_percent = round(float((total and processed/total or 0) * 100), 2)
-                    if ci_percent > ci_percent_last:
-                        print(f'Progress: {ci_percent}%')
-                        ci_percent_last = ci_percent
+                ci_percent = round(float((total and processed/total or 0) * 100), 2)
+                if ci_percent > ci_percent_last:
+                    print(f'Progress: {ci_percent}%')
+                    ci_percent_last = ci_percent
 
-                for future in futures:
-                    future.result()
+            for future in futures:
+                future.result()
 
         print('Generating data and file')
 
         mypois.main()
-        progress.update(overall_progress_task, completed=n_finished+1, total=len(futures)+3)
 
         [os.remove(f) for f in glob.glob('output/*.zip')]
         f_name = 'OSM_POI_Europe'
@@ -357,5 +365,3 @@ if __name__ == "__main__":
         shutil.move(f'{f_name}.zip', 'output/')
 
         print('Done')
-
-        progress.update(overall_progress_task, completed=1, total=1)
