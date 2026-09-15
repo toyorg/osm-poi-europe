@@ -199,7 +199,7 @@ countries_count = len(countries)
 
 OVERPASS_URLS = [
     'https://overpass-api.de/api/interpreter',
-    'https://overpass.private.coffee/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ]
 USER_AGENT = 'osm-poi-europe'
 
