@@ -10,7 +10,7 @@ dependencies = [
   "requests==2.34.2",
   "retrying==1.4.2",
   "rich==15.0.0",
-  "shapely==2.1.2",
+  "shapely==2.2.0",
 ]
 
 [tool.uv]
