@@ -5,10 +5,13 @@ import glob
 import inspect
 import multiprocessing
 import os
+import random
+import re
 import requests
 import shutil
+import time
 from concurrent.futures import ProcessPoolExecutor
-from retrying import retry
+from urllib.parse import urlparse
 from shapely.geometry import Point, Polygon
 
 import mypois
@@ -138,12 +141,12 @@ countries = {
     # 'Åland Islands': 2375170,
     'Albania': 53292,
     'Andorra': 9407,
-    'Armenia': 364066,
+    # 'Armenia': 364066,  # mostly outside europe_polygon, POIs would be dropped anyway
     'Austria': 16239,
     # 'Azerbaijan': 364110,
     'Belarus': 59065,
     'Belgium': 52411,
-    'Bosnia and Herzegovina': 214908,
+    'Bosnia and Herzegovina': 2528142,
     'Bulgaria': 186382,
     'Croatia': 214885,
     'Cyprus': 307787,
@@ -170,7 +173,7 @@ countries = {
     'Latvia': 72594,
     'Liechtenstein': 1155955,
     'Lithuania': 72596,
-    'Luxembourg': 28711,
+    'Luxembourg': 2171347,
     'North Macedonia': 53293,
     'Malta': 365307,
     'Moldova': 58974,
@@ -191,34 +194,138 @@ countries = {
     'Switzerland': 51701,
     'Turkey': 174737,
     'Ukraine': 60199,
-    'United Kingdom': 51684,
+    'United Kingdom': 62149,
     'Vatican': 36989
 }
 
 countries_count = len(countries)
+assert len(set(countries.values())) == countries_count, 'Duplicate relation ID in countries'
 
 OVERPASS_URLS = [
     'https://overpass-api.de/api/interpreter',
     'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ]
 USER_AGENT = 'osm-poi-europe'
+# (connect, read) in seconds. Queries use [timeout:300], so allow the server to
+# finish before giving up on a stalled connection.
+REQUEST_TIMEOUT = (30, 360)
+# overpass-api.de allows only a couple of concurrent queries per IP; more just
+# produces 429s. Shared across all worker processes via init_worker().
+OVERPASS_CONCURRENCY = 2
+MAX_ATTEMPTS = 10
+BACKOFF_BASE = 30   # seconds; doubles each attempt (with jitter) ...
+BACKOFF_MAX = 600   # ... up to this cap
+RETRYABLE_STATUS = {429, 502, 503, 504}
+
+_overpass_slots = None
 
 
-@retry(wait_random_min=30000, wait_random_max=60000, stop_max_attempt_number=10)
+def init_worker(slots):
+    global _overpass_slots
+    _overpass_slots = slots
+
+
+def _retry_after(response):
+    try:
+        return float(response.headers.get('Retry-After', ''))
+    except ValueError:
+        return 0.0
+
+
+_country_by_area = {3600000000 + relationid: name for name, relationid in countries.items()}
+
+
+def _describe_query(query):
+    """'Albania · enforcement=average_speed' instead of the raw Overpass QL."""
+    area = re.search(r'area\(id:(\d+)\)', query)
+    country = _country_by_area.get(int(area.group(1)), f'area {area.group(1)}') if area else 'unknown area'
+    selector = re.search(r'(?:nwr|node|way|relation)\[([^\]]+)\]', query)
+    what = selector.group(1).replace('"', '') if selector else query[:60]
+    return f'{country} · {what}'
+
+
+def _describe_response(response):
+    """'HTTP 502 Gateway Timeout: This Overpass API server is currently at capacity.'"""
+    text = response.text or ''
+    title = re.search(r'<title>(.*?)</title>', text, re.IGNORECASE | re.DOTALL)
+    heading = re.search(r'^#+\s*(.+)$', text, re.MULTILINE)
+    reason = ' '.join((title or heading).group(1).split()) if (title or heading) else (response.reason or '')
+    reason = re.sub(rf'^{response.status_code}\s*', '', reason)
+
+    detail = ''
+    if not title:  # HTML error pages carry nothing beyond the title
+        paragraphs = [' '.join(p.split()) for p in re.split(r'\n\s*\n', re.sub(r'<[^>]+>', '', text))]
+        paragraphs = [p for p in paragraphs if p and not p.startswith('#')]
+        if paragraphs:
+            detail = re.split(r'(?<=[.!?])\s', paragraphs[0])[0][:120]
+
+    summary = f'HTTP {response.status_code} {reason}'.strip()
+    return f'{summary}: {detail}' if detail and detail != reason else summary
+
+
+def _describe_exception(exc):
+    if isinstance(exc, requests.ConnectTimeout):
+        return f'could not connect within {REQUEST_TIMEOUT[0]}s'
+    if isinstance(exc, requests.ReadTimeout):
+        return f'no response within {REQUEST_TIMEOUT[1]}s'
+    if isinstance(exc, requests.ConnectionError):
+        return 'connection failed'
+    return type(exc).__name__
+
+
 def get_data(query):
     start_index = abs(hash(query)) % len(OVERPASS_URLS)
     ordered_urls = OVERPASS_URLS[start_index:] + OVERPASS_URLS[:start_index]
-    last_exception = None
 
-    for url in ordered_urls:
-        try:
-            response = requests.post(url, data={'data': query}, headers={'User-Agent': USER_AGENT})
-            if response.status_code == 200:
-                return response.json()['elements']
-        except requests.RequestException as exc:
-            last_exception = exc
+    description = _describe_query(query)
 
-    raise requests.ConnectionError('All Overpass endpoints failed') from last_exception
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        errors = []
+        server_wait = 0.0
+
+        for url in ordered_urls:
+            host = urlparse(url).hostname
+            try:
+                # Hold a shared slot only while the request runs, not while backing off.
+                with _overpass_slots or contextlib.nullcontext():
+                    response = requests.post(url, data={'data': query}, headers={'User-Agent': USER_AGENT}, timeout=REQUEST_TIMEOUT)
+            except requests.RequestException as exc:
+                errors.append(f'{host}: {_describe_exception(exc)}')
+                continue
+
+            if response.status_code != 200:
+                errors.append(f'{host}: {_describe_response(response)}')
+                if response.status_code == 400:  # malformed query: retrying won't help
+                    raise requests.HTTPError(f'{description}: query rejected by {errors[-1]}\n{query}')
+                if response.status_code in RETRYABLE_STATUS:
+                    server_wait = max(server_wait, _retry_after(response))
+                continue
+
+            try:
+                payload = response.json()
+            except ValueError:
+                errors.append(f'{host}: response is not valid JSON')
+                continue
+
+            # Overpass reports timeouts / out-of-memory as HTTP 200 with a 'remark'
+            # and partial elements, so treat that as a failure and retry.
+            remark = payload.get('remark', '')
+            if 'error' in remark.lower():
+                errors.append(f'{host}: Overpass error: {" ".join(remark.split())[:150]}')
+                continue
+
+            return payload['elements']
+
+        details = ''.join(f'\n    {error}' for error in errors)
+        if attempt == MAX_ATTEMPTS:
+            message = f'{description}: gave up after {MAX_ATTEMPTS} attempts{details}'
+            print(message, flush=True)
+            raise requests.ConnectionError(message)
+
+        backoff = min(BACKOFF_MAX, BACKOFF_BASE * 2 ** (attempt - 1))
+        delay = max(server_wait, random.uniform(backoff / 2, backoff))
+        print(f'{description}: attempt {attempt}/{MAX_ATTEMPTS} failed, retrying in {delay:.0f}s{details}', flush=True)
+        time.sleep(delay)
 
 
 def generate_gpx(array, points_series, name):
@@ -234,17 +341,29 @@ def average_speed(_progress, _task_id):
     data = []
     for i, (_, relationid) in enumerate(countries.items(), start=1):
         data += get_data(f'[out:json][timeout:300];area(id:{3600000000+relationid})->.searchArea;nwr["enforcement"="average_speed"](area.searchArea);out geom;')
-        _progress[_task_id] = {"progress": i + 1, "total": countries_count+1}
+        _progress[_task_id] = i  # countries downloaded so far
 
-    tmp = [i for j in data for i in j.get('members', {}) if j.get('members') and i.get('role') in ['from', 'to'] and i.get('type') != 'way']
-    tmp += [j for j in data if j.get('type') == 'node' and j.get('lon')]
+    tmp = []
+    for element in data:
+        if element.get('type') != 'relation':
+            if element.get('type') == 'node' and 'lon' in element:
+                tmp.append(element)
+            continue
+        for member in element.get('members', []):
+            if member.get('role') not in ('from', 'to'):  # add 'device' to include the cameras themselves
+                continue
+            if member.get('type') == 'node' and 'lon' in member:
+                tmp.append(member)
+            elif member.get('type') == 'way' and member.get('geometry'):
+                geometry = member['geometry']
+                tmp.append(geometry[len(geometry) // 2])  # middle point of the way; has lon/lat
 
     if tmp:
         points_array = [Point(x['lon'], x['lat']) for x in tmp]
         points_series = gpd.GeoSeries(points_array)
         array = [{"name": "Average speed camera"} for _ in points_array]
         generate_gpx(array, points_series, inspect.currentframe().f_code.co_name) # type: ignore
-        _progress[_task_id] = {"progress": 1, "total": 1}
+        _progress[_task_id] = countries_count + 1  # GPX written
     return
 
 
@@ -252,14 +371,18 @@ def fuel_stations(_progress, _task_id):
     data = []
     for i, (_, relationid) in enumerate(countries.items(), start=1):
         data += get_data(f'[out:json][timeout:300];area(id:{3600000000+relationid})->.searchArea;nwr["amenity"="fuel"](area.searchArea);convert item ::=::,::geom=geom(),_osm_type=type();out center;')
-        _progress[_task_id] = {"progress": i + 1, "total": countries_count+1}
+        _progress[_task_id] = i  # countries downloaded so far
 
     if data:
-        points_array = [Point(x["geometry"]["coordinates"][0], x["geometry"]["coordinates"][1]) for x in data if 'node/' not in x.get('tags').get('name', 'node/')]
+        points_array, array = [], []
+        for x in data:
+            tags = x.get('tags') or {}
+            lon, lat = x["geometry"]["coordinates"][:2]
+            points_array.append(Point(lon, lat))
+            array.append({"name": tags.get("brand") or tags.get("name") or tags.get("operator") or "Fuel station"})
         points_series = gpd.GeoSeries(points_array)
-        array = [{"name": x["tags"].get("brand", x["tags"].get("name", "node/"))} for x in data if 'node/' not in x.get('tags').get('name', 'node/')]
         generate_gpx(array, points_series, inspect.currentframe().f_code.co_name) # type: ignore
-        _progress[_task_id] = {"progress": 1, "total": 1}
+        _progress[_task_id] = countries_count + 1  # GPX written
         return
 
 
@@ -267,44 +390,44 @@ def speed_bumps(_progress, _task_id):
     data = []
     for i, (_, relationid) in enumerate(countries.items(), start=1):
         data += get_data(f'[out:json][timeout:300];area(id:{3600000000+relationid})->.searchArea;nwr["traffic_calming"](area.searchArea);out center;')
-        _progress[_task_id] = {"progress": i + 1, "total": countries_count+1}
+        _progress[_task_id] = i  # countries downloaded so far
 
     if data:
-        points_array = [Point(x["lon"], x["lat"]) for x in data if x["type"] == "node"]
+        points_array = [Point(x["lon"], x["lat"]) if x["type"] == "node" else Point(x["center"]["lon"], x["center"]["lat"]) for x in data if "lon" in x or "center" in x]
         points_series = gpd.GeoSeries(points_array)
         array = [{"name": "Speed bump"} for _ in points_array]
         generate_gpx(array, points_series, inspect.currentframe().f_code.co_name) # type: ignore
-        _progress[_task_id] = {"progress": 1, "total": 1}
+        _progress[_task_id] = countries_count + 1  # GPX written
         return
 
 
 def rail_crossings(_progress, _task_id):
     data = []
     for i, (_, relationid) in enumerate(countries.items(), start=1):
-        data += get_data(f'[out:json][timeout:300];area(id:{3600000000+relationid})->.searchArea;nwr["railway"="level_crossing"](area.searchArea);out center;')
-        _progress[_task_id] = {"progress": i + 1, "total": countries_count+1}
+        data += get_data(f'[out:json][timeout:300];area(id:{3600000000+relationid})->.searchArea;node["railway"="level_crossing"](area.searchArea);out;')
+        _progress[_task_id] = i  # countries downloaded so far
 
     if data:
         points_array = [Point(x["lon"], x["lat"]) for x in data if x["type"] == "node"]
         points_series = gpd.GeoSeries(points_array)
         array = [{"name": "Rail crossing"} for _ in points_array]
         generate_gpx(array, points_series, inspect.currentframe().f_code.co_name) # type: ignore
-        _progress[_task_id] = {"progress": 1, "total": 1}
+        _progress[_task_id] = countries_count + 1  # GPX written
         return
 
 
 def speed_cameras(_progress, _task_id):
     data = []
     for i, (_, relationid) in enumerate(countries.items(), start=1):
-        data += get_data(f'[out:json][timeout:300];area(id:{3600000000+relationid})->.searchArea;nwr["highway"="speed_camera"](area.searchArea);out center;')
-        _progress[_task_id] = {"progress": i + 1, "total": countries_count+1}
+        data += get_data(f'[out:json][timeout:300];area(id:{3600000000+relationid})->.searchArea;node["highway"="speed_camera"](area.searchArea);out;')
+        _progress[_task_id] = i  # countries downloaded so far
 
     if data:
         points_array = [Point(x["lon"], x["lat"]) for x in data if x["type"] == "node"]
         points_series = gpd.GeoSeries(points_array)
         array = [{"name": "Speed camera"} for _ in points_array]
         generate_gpx(array, points_series, inspect.currentframe().f_code.co_name) # type: ignore
-        _progress[_task_id] = {"progress": 1, "total": 1}
+        _progress[_task_id] = countries_count + 1  # GPX written
         return
 
 
@@ -312,7 +435,7 @@ def fast_food(_progress, _task_id):
     data = []
     for i, (_, relationid) in enumerate(countries.items(), start=1):
         data += get_data(f'[out:json][timeout:300];area(id:{3600000000+relationid})->.searchArea;nwr["amenity"="fast_food"](area.searchArea);convert item ::=::,::geom=geom(),_osm_type=type();out center;')
-        _progress[_task_id] = {"progress": i + 1, "total": countries_count+1}
+        _progress[_task_id] = i  # countries downloaded so far
 
     if data:
         wanted = ["McDonald's", "Burger King", "Subway", "KFC", "Max Premium Burgers"]
@@ -320,7 +443,7 @@ def fast_food(_progress, _task_id):
         points_series = gpd.GeoSeries(points_array)
         array = [{"name": x.get('tags', {}).get('brand')} for x in data if x.get('tags', {}).get('brand') in wanted]
         generate_gpx(array, points_series, inspect.currentframe().f_code.co_name) # type: ignore
-        _progress[_task_id] = {"progress": 1, "total": 1}
+        _progress[_task_id] = countries_count + 1  # GPX written
         return
 
 
@@ -331,26 +454,53 @@ if __name__ == "__main__":
 
     print('Downloading data')
 
-    futures = []
+    futures = {}
     with multiprocessing.Manager() as manager:
         _progress = manager.dict()
-        with ProcessPoolExecutor(max_workers=8) as executor:
-            for i in [eval(f) for f in config.sections() if f != 'General']:
+        overpass_slots = manager.BoundedSemaphore(OVERPASS_CONCURRENCY)
+        with ProcessPoolExecutor(max_workers=8, initializer=init_worker, initargs=(overpass_slots,)) as executor:
+            for i in [eval(f) for f in config.sections() if f != 'General' and not config.getboolean(f, 'Disabled', fallback=False)]:
                 task_id = f"{i.__name__}"
-                futures.append(executor.submit(i, _progress, task_id))
+                futures[executor.submit(i, _progress, task_id)] = task_id
 
-            ci_percent, ci_percent_last = 0.0, 0.0
+            # Every task has one step per country plus one for writing its GPX.
+            steps_per_task = countries_count + 1
+            total_steps = len(futures) * steps_per_task
+            last_percent = -1
 
-            while (n_finished := sum(future.done() for future in futures)) < len(futures):
-                processed,total = 0,0
-                for task_id, update_data in _progress.items():
-                    processed+=update_data["progress"]
-                    total+=update_data["total"]
+            while True:
+                done = [future for future in futures if future.done()]
+                failed = next((future for future in done if future.exception() is not None), None)
+                if failed is not None:
+                    # Fail fast: the run can't produce a release anyway, so stop
+                    # the other tasks instead of waiting hours for them.
+                    print(f'Task {futures[failed]} failed, aborting remaining tasks', flush=True)
+                    if hasattr(executor, 'terminate_workers'):  # Python 3.14+
+                        executor.terminate_workers()
+                    else:
+                        # No public API before 3.14; snapshot workers before
+                        # shutdown() clears executor._processes.
+                        workers = list((executor._processes or {}).values())
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        for process in workers:
+                            process.terminate()
+                    raise failed.exception()  # type: ignore
+                if len(done) == len(futures):
+                    break
 
-                ci_percent = round(float((total and processed/total or 0) * 100), 2)
-                if ci_percent > ci_percent_last:
-                    print(f'Progress: {ci_percent}%')
-                    ci_percent_last = ci_percent
+                # Tasks that haven't reported yet count as 0; finished tasks
+                # count as complete even if they had no data to write.
+                reported = dict(_progress)
+                processed = sum(steps_per_task if future.done() else reported.get(task_id, 0)
+                                for future, task_id in futures.items())
+                percent = processed * 100 // total_steps
+                if percent > last_percent:
+                    print(f'Progress: {percent}% ({processed}/{total_steps} steps)', flush=True)
+                    last_percent = percent
+
+                time.sleep(1)
+
+            print(f'Progress: 100% ({total_steps}/{total_steps} steps)', flush=True)
 
             for future in futures:
                 future.result()

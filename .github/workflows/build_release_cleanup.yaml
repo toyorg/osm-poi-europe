@@ -2,7 +2,7 @@ name: Build, Release, and Cleanup Workflow
 
 on:
   schedule:
-    - cron: "0 0 * * 1" # Runs on mondays at midnight UTC
+    - cron: "0 22 * * 1" # Runs on mondays at 22 UTC
   workflow_dispatch: # Allows manual triggering
 
 permissions:
@@ -31,7 +31,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.15"
+          python-version: "3.13"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v10.3.3
