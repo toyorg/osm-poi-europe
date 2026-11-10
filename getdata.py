@@ -202,10 +202,17 @@ countries_count = len(countries)
 assert len(set(countries.values())) == countries_count, 'Duplicate relation ID in countries'
 
 OVERPASS_URLS = [
+    'https://api.overpass-turbo.eu/interpreter',
     'https://overpass-api.de/api/interpreter',
     'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ]
-USER_AGENT = 'osm-poi-europe'
+USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:159.0) Gecko/20100101 Firefox/159.0'
+
+EXTRA_HEADERS = {
+    'https://api.overpass-turbo.eu/interpreter': {
+        'Referer': 'https://overpass-turbo.eu/',
+    },
+}
 # (connect, read) in seconds. Queries use [timeout:300], so allow the server to
 # finish before giving up on a stalled connection.
 REQUEST_TIMEOUT = (30, 360)
@@ -288,7 +295,7 @@ def get_data(query):
             try:
                 # Hold a shared slot only while the request runs, not while backing off.
                 with _overpass_slots or contextlib.nullcontext():
-                    response = requests.post(url, data={'data': query}, headers={'User-Agent': USER_AGENT}, timeout=REQUEST_TIMEOUT)
+                    response = requests.post(url, data={'data': query}, headers={'User-Agent': USER_AGENT, **EXTRA_HEADERS.get(url, {})}, timeout=REQUEST_TIMEOUT)
             except requests.RequestException as exc:
                 errors.append(f'{host}: {_describe_exception(exc)}')
                 continue
@@ -304,7 +311,14 @@ def get_data(query):
             try:
                 payload = response.json()
             except ValueError:
-                errors.append(f'{host}: response is not valid JSON')
+                # Overpass sometimes answers HTTP 200 with its HTML "OSM3S Response"
+                # page carrying the real error (e.g. duplicate_query, rate_limited).
+                page = ' '.join(re.sub(r'<[^>]+>', ' ', response.text).split())
+                overpass_error = re.search(r'Error\s*:\s*(.+)', page)
+                if overpass_error:
+                    errors.append(f'{host}: Overpass error: {overpass_error.group(1)[:150]}')
+                else:
+                    errors.append(f'{host}: response is not valid JSON')
                 continue
 
             # Overpass reports timeouts / out-of-memory as HTTP 200 with a 'remark'
